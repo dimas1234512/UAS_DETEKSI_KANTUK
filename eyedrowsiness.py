@@ -1,214 +1,119 @@
-import streamlit as st
 import cv2
-import numpy as np
+import os
 import tensorflow as tf
-import time
+from tensorflow.keras.models import load_model
+import numpy as np
+import streamlit as st
+from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, RTCConfiguration
+import av
 
-# --- SETUP HALAMAN SEDERHANA ---
-st.set_page_config(page_title="Deteksi Kantuk + Delay Cerdas", layout="wide")
+# --- KONFIGURASI HALAMAN ---
+st.set_page_config(page_title="Deteksi Kantuk", layout="centered")
 
-# --- 1. LOAD MODEL ---
+# --- LOAD MODEL (Dicache agar cepat) ---
 @st.cache_resource
-def load_model():
-    # Pastikan file model ada di folder yang sama
-    interpreter = tf.lite.Interpreter(model_path="deteksi-kantuk.tflite")
-    interpreter.allocate_tensors()
-    return interpreter
+def load_keras_model():
+    # Pastikan file model ada di folder yang sama atau sesuaikan path-nya
+    # Jika file model Anda bernama 'model_kantuk.h5', ganti di bawah ini:
+    model_path = 'models/2024-11-16_02-39-31.h5' 
+    if not os.path.exists(model_path):
+        st.error(f"File model tidak ditemukan di: {model_path}. Mohon upload file model .h5 Anda.")
+        return None
+    return load_model(model_path)
 
-try:
-    interpreter = load_model()
-    input_details = interpreter.get_input_details()
-    output_details = interpreter.get_output_details()
-except Exception as e:
-    st.error("Model 'deteksi-kantuk.tflite' tidak ditemukan! Pastikan file ada satu folder dengan app.py")
-    st.stop()
+model = load_keras_model()
 
-# --- 2. SETUP WAJAH & MATA ---
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
+# --- LOAD FACE DETECTOR BAWAAN OPENCV ---
+face = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_alt.xml')
+leye = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_lefteye_2splits.xml')
+reye = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_righteye_2splits.xml')
 
-# --- 3. FUNGSI SUARA (BEEP) ---
-def play_alarm():
-    # Suara alarm
-    sound_html = """
-    <audio autoplay>
-    <source src="https://assets.mixkit.co/active_storage/sfx/2869/2869-preview.mp3" type="audio/mp3">
-    </audio>
-    """
-    st.components.v1.html(sound_html, height=0, width=0)
+# --- LOGIKA PEMROSESAN VIDEO ---
+class VideoProcessor(VideoTransformerBase):
+    def __init__(self):
+        self.score = 0
+        self.rpred = [99]
+        self.lpred = [99]
 
-# --- 4. PREDIKSI ---
-def predict_eye(eye_img):
-    img_resized = cv2.resize(eye_img, (64, 64))
-    input_data = np.array(img_resized, dtype=np.float32)
-    input_data = input_data / 255.0
-    input_data = np.expand_dims(input_data, axis=0)
-    interpreter.set_tensor(input_details[0]['index'], input_data)
-    interpreter.invoke()
-    return interpreter.get_tensor(output_details[0]['index'])[0][0]
+    def recv(self, frame):
+        # Konversi frame dari WebRTC ke format OpenCV
+        img = frame.to_ndarray(format="bgr24")
+        height, width = img.shape[:2]
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-# ==========================================
-# TAMPILAN UTAMA (UI)
-# ==========================================
+        faces = face.detectMultiScale(gray, minNeighbors=5, scaleFactor=1.1, minSize=(25, 25))
+        left_eye = leye.detectMultiScale(gray)
+        right_eye = reye.detectMultiScale(gray)
 
-st.sidebar.title("🔧 Pengaturan")
-st.sidebar.write("Atur sensitivitas waktu di bawah ini.")
+        # Gambar kotak di wajah (Opsional, untuk debug)
+        cv2.rectangle(img, (0, height-50), (200, height), (0, 0, 0), thickness=cv2.FILLED)
 
-# Slider Waktu Tunggu (Default 3 Detik)
-alarm_threshold = st.sidebar.slider("Waktu Tunggu (Detik) sebelum Alarm:", 1.0, 10.0, 3.0, 0.5) 
-
-run_camera = st.sidebar.checkbox("Buka Kamera", value=False)
-
-st.title("👁️ Deteksi Kantuk Pengemudi")
-st.info(f"Sistem stabil: Jika wajah goyang, timer tetap lanjut. Alarm bunyi setelah **{alarm_threshold} detik**.")
-
-col1, col2, col3 = st.columns(3)
-with col1:
-    st.markdown("**Status Saat Ini**")
-    status_text = st.empty()
-with col2:
-    st.markdown("**Skor Mata Terbuka**")
-    kpi_text = st.empty()
-with col3:
-    st.markdown("**⏳ Timer Mata Tertutup**")
-    timer_text = st.empty()
-
-frame_window = st.image([])
-
-# ==========================================
-# LOOP KAMERA (DIPERBAIKI)
-# ==========================================
-
-if run_camera:
-    camera = cv2.VideoCapture(0)
-    
-    # Variabel Timer Utama
-    start_time_closed = None 
-    
-    while run_camera:
-        ret, frame = camera.read()
-        if not ret:
-            st.error("Gagal membaca kamera.")
+        # --- LOGIKA DETEKSI MATA KANAN ---
+        for (x, y, w, h) in right_eye:
+            r_eye = img[y:y+h, x:x+w]
+            r_eye = cv2.cvtColor(r_eye, cv2.COLOR_BGR2GRAY)
+            r_eye = cv2.resize(r_eye, (24, 24))
+            r_eye = r_eye / 255
+            r_eye = r_eye.reshape(24, 24, -1)
+            r_eye = np.expand_dims(r_eye, axis=0)
+            
+            # Prediksi
+            if model is not None:
+                self.rpred = np.argmax(model.predict(r_eye), axis=-1)
             break
-        
-        # Mirror & Warna
-        frame = cv2.flip(frame, 1)
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        
-        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
-        
-        # --- LOGIKA STATUS PER FRAME ---
-        # 1. TERTUTUP (Terdeteksi mata tertutup)
-        # 2. TERBUKA (Terdeteksi mata terbuka)
-        # 3. TIDAK_TAHU (Wajah hilang / goyang / tidak jelas)
-        
-        status_frame_ini = "TIDAK_TAHU" # Default jika wajah tidak ketemu
-        box_color = (100, 100, 100)
-        score_display = 0
 
-        # Deteksi Wajah & Mata
-        for (x, y, w, h) in faces:
-            roi_gray = gray[y:y+h, x:x+w]
-            roi_color = rgb_frame[y:y+h, x:x+w]
+        # --- LOGIKA DETEKSI MATA KIRI ---
+        for (x, y, w, h) in left_eye:
+            l_eye = img[y:y+h, x:x+w]
+            l_eye = cv2.cvtColor(l_eye, cv2.COLOR_BGR2GRAY)
+            l_eye = cv2.resize(l_eye, (24, 24))
+            l_eye = l_eye / 255
+            l_eye = l_eye.reshape(24, 24, -1)
+            l_eye = np.expand_dims(l_eye, axis=0)
             
-            eyes = eye_cascade.detectMultiScale(roi_gray)
-            probs = []
-            
-            for (ex, ey, ew, eh) in eyes:
-                eye_img = roi_color[ey:ey+eh, ex:ex+ew]
-                pred = predict_eye(eye_img)
-                probs.append(pred)
-                
-                # Kotak Mata
-                e_color = (0, 255, 0) if pred > 0.5 else (255, 0, 0)
-                cv2.rectangle(roi_color, (ex, ey), (ex+ew, ey+eh), e_color, 2)
-            
-            if len(probs) > 0:
-                avg_score = sum(probs) / len(probs)
-                score_display = int(avg_score * 100)
-                
-                # Tentukan status frame ini
-                if avg_score < 0.5: 
-                    status_frame_ini = "TERTUTUP"
-                    box_color = (255, 255, 0) 
-                else:
-                    status_frame_ini = "TERBUKA"
-                    box_color = (0, 255, 0)
+            # Prediksi
+            if model is not None:
+                self.lpred = np.argmax(model.predict(l_eye), axis=-1)
+            break
 
-            # Gambar Kotak Wajah
-            cv2.rectangle(rgb_frame, (x, y), (x+w, y+h), box_color, 3)
-
-        # ==========================================
-        # LOGIKA TIMER PINTAR (ANTI-RESET)
-        # ==========================================
-        
-        duration_closed = 0
-        final_status_text = ""
-
-        # KONDISI 1: Mata Jelas TERTUTUP
-        if status_frame_ini == "TERTUTUP":
-            if start_time_closed is None:
-                start_time_closed = time.time() # Mulai timer
-            
-            duration_closed = time.time() - start_time_closed
-            final_status_text = "Mata Tertutup..."
-
-        # KONDISI 2: Mata Jelas TERBUKA
-        elif status_frame_ini == "TERBUKA":
-            start_time_closed = None # RESET Timer (Hanya di sini reset terjadi)
-            duration_closed = 0
-            final_status_text = "✅ AMAN"
-
-        # KONDISI 3: Wajah Hilang / Goyang (TIDAK_TAHU)
+        # --- PERHITUNGAN SKOR & STATUS ---
+        # 0 = Closed, 1 = Open (Sesuaikan dengan label model Anda)
+        if self.rpred[0] == 0 and self.lpred[0] == 0:
+            self.score += 1
+            cv2.putText(img, "Closed", (10, height-20), cv2.FONT_HERSHEY_COMPLEX_SMALL, 1, (255, 255, 255), 1, cv2.LINE_AA)
         else:
-            # Jika sebelumnya timer sudah jalan, LANJUTKAN timer.
-            # Jangan di-reset. Asumsikan user masih merem tapi wajahnya goyang.
-            if start_time_closed is not None:
-                duration_closed = time.time() - start_time_closed
-                final_status_text = "⚠️ Wajah Hilang (Timer Lanjut...)"
-            else:
-                final_status_text = "Mencari Wajah..."
+            self.score -= 1
+            cv2.putText(img, "Open", (10, height-20), cv2.FONT_HERSHEY_COMPLEX_SMALL, 1, (255, 255, 255), 1, cv2.LINE_AA)
 
-        # --- CEK ALARM ---
-        if duration_closed > alarm_threshold:
-            final_status_text = "⚠️ BAHAYA: NGANTUK!"
+        if self.score < 0:
+            self.score = 0
             
-            # Visualisasi Merah (Alarm)
-            cv2.putText(rgb_frame, f"BANGUN! ({duration_closed:.1f}s)", (50, 100), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 0, 0), 4)
-            cv2.rectangle(rgb_frame, (0,0), (640,480), (255,0,0), 10) 
+        cv2.putText(img, 'Score:' + str(self.score), (100, height-20), cv2.FONT_HERSHEY_COMPLEX_SMALL, 1, (255, 255, 255), 1, cv2.LINE_AA)
+
+        # --- TRIGGER ALARM VISUAL ---
+        if self.score > 15:
+            # Peringatan Visual: Kotak Merah Tebal di sekeliling layar
+            cv2.rectangle(img, (0, 0), (width, height), (0, 0, 255), 20)
+            # Tulisan Peringatan
+            cv2.putText(img, "BANGUN!!!", (int(width/2)-100, int(height/2)), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 4)
             
-            play_alarm()
-
-        elif start_time_closed is not None:
-            # Visualisasi Kuning (Timer Berjalan)
-            cv2.putText(rgb_frame, f"Timer: {duration_closed:.1f}s", (10, 30), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-
-        # Tampilkan Video
-        frame_window.image(rgb_frame)
-        
-        # Update Teks UI
-        if "BAHAYA" in final_status_text:
-            status_text.error(final_status_text)
-        elif "Tertutup" in final_status_text:
-            status_text.warning(final_status_text)
-        elif "Lanjut" in final_status_text:
-            status_text.warning(final_status_text) # Kuning (Waspada)
-        elif "AMAN" in final_status_text:
-            status_text.success(final_status_text)
-        else:
-            status_text.info(final_status_text)
+            # Note: Suara pygame dihapus karena tidak akan terdengar di cloud.
             
-        kpi_text.metric("Skor Mata", f"{score_display} %")
-        
-        # Update Tampilan Timer
-        if duration_closed > 0:
-             timer_text.metric("Timer", f"{duration_closed:.2f} s")
-        else:
-             timer_text.metric("Timer", "0.00 s")
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-    camera.release()
+# --- TAMPILAN STREAMLIT ---
+st.title("Sistem Deteksi Kantuk Pengendara")
+st.write("Pastikan izinkan akses kamera di browser Anda.")
+
+if model is None:
+    st.warning("Model belum dimuat. Pastikan file .h5 sudah diupload.")
 else:
-    st.info("Klik 'Buka Kamera' di menu sebelah kiri.")
+    # Konfigurasi STUN server agar bisa jalan online
+    webrtc_streamer(
+        key="drowsiness-detection",
+        video_processor_factory=VideoProcessor,
+        rtc_configuration={
+            "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+        },
+        media_stream_constraints={"video": True, "audio": False}
+    )
